@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.optimize import root
 from butcher_tableau import EmbeddedTableau, measure_error, compute_time
+from utils import process_function_list, save_result_setup, save_result_step
 try:
     from firedrake import Function, inner, dx, replace, split, Constant, TestFunction, solve, DirichletBC, CheckpointFile
 except:
@@ -253,12 +254,25 @@ def ark_step_implicit_fem(f, step, y0, t0, methods, rtol=1e-3, atol=1e-6, contro
     return step, step_old, y0
 
 
-def ark_solve(functions, dt, y0, t0, tf, methods, rtol=1e-3, atol=1e-6, bc=None, solver_parameters={}, fname=None, save_steps = 0, jacobian = None):
+def ark_solve(master_function, dt, y0, t0, tf, methods, function_labels=None, rtol=1e-3, atol=1e-6, bc=None, solver_parameters={}, fname=None, save_steps = 0, jacobian = None):
     """ This function uses an additive runge kutta method to solve a differential equation
     -----
     Inputs:
-    functions - the operators of the differential equation, each with inputs (t, y)
-                these may also be finite element Forms from firedrake.
+    master_function : list of functions or callable function(t, y, label)
+        if list of functions:
+            each is used use to approximate the differential equation in order
+            the functions will be numbered 1 to n
+            if any element returns np.nan, that element will not be integrated for 
+            that time step
+            inputs are (t, y)
+            These may also be finite element Forms as provided by firedrake, or
+            tuples of (Form, boundary condition)
+        if callable function(t, y, label):
+            each label is used to select the function to use
+            the labels are provided in function_labels
+            the function will be called with inputs (t, y, label)
+            then each function will be processed with process_label()
+            and the result will be a list of functions used to approximate the differential equation
     dt - the amount time will increase by
     y0 - the current value of y
          if the functions are Forms, this should be of type Function
@@ -267,6 +281,11 @@ def ark_solve(functions, dt, y0, t0, tf, methods, rtol=1e-3, atol=1e-6, bc=None,
     tf - the time to solve until
     methods - a listing of the butcher tableau for each operator.  This should be a list of Tableau with length at least the number of operators provided.
         Note: if length exceeds the length of the functions list, the extra methods will be ignored
+    function_labels - optional. list of strings or tuples of strings
+        the labels to use for each function in master_function
+        tuples should be of the form (label1, label2, ...)
+        which is then mapped to the operator O(t,y) = master_function(t,y,label1) + master_function(t,y,label2) + ...
+        if master_function is a list of functions, this is ignored
     bc - optional.  Only used if using the finite element version.  The boundary condition(s) to apply.
     solver_parameters - optional.  Only used for the finite element version.  Any solver parameters to use (see firedrake documentation for details)
     fname - optional.  If provided, will save intermediate results to this file.
@@ -279,6 +298,9 @@ def ark_solve(functions, dt, y0, t0, tf, methods, rtol=1e-3, atol=1e-6, bc=None,
     -----
     the approximate value of y at tf
     """
+
+    functions = process_function_list(master_function, function_labels, y0)
+
     if len(functions) > len(methods):
         print("ERROR: not enough tableau provided")
         return 
@@ -321,17 +343,7 @@ def ark_solve(functions, dt, y0, t0, tf, methods, rtol=1e-3, atol=1e-6, bc=None,
         save_interval = dt
 
     if fname is not None:
-        if isinstance(y0, Function):
-            f = CheckpointFile(fname, 'w')
-            f.save_mesh(y0.function_space().mesh())
-            f.save_function(y0, idx=0)
-            f.create_group('times')
-            f.set_attr('/times', '0', t)
-            count_save = 1
-            f.set_attr('/times', 'last_idx', 0)
-        else:
-            f = open(fname, 'wb')
-            np.savetxt(f, [[t] + [x for x in y0]], delimiter=',')
+        f, count_save = save_result_setup(fname, y0, t0, t)
         saved = t
     
     while t < tf:
@@ -348,13 +360,7 @@ def ark_solve(functions, dt, y0, t0, tf, methods, rtol=1e-3, atol=1e-6, bc=None,
         else:
             t0 = t
         if fname is not None and t - saved - save_interval > -1e-8:
-            if isinstance(y0, Function):
-                f.save_function(y0, idx=count_save)
-                f.set_attr('/times', str(count_save), t)
-                f.set_attr('/times', 'last_idx', count_save)
-                count_save += 1
-            else:
-                np.savetxt(f, [[t] + [x for x in y0]], delimiter=',')
+            count_save = save_result_step(f, y0, t, count_save)
             saved += ((t - saved + 1e-8) // save_interval) * save_interval
         dt = dt_new
         if abs(dt) < 1e-10 and control:
@@ -368,14 +374,6 @@ def ark_solve(functions, dt, y0, t0, tf, methods, rtol=1e-3, atol=1e-6, bc=None,
         else:
             t0 = t
     if fname is not None and t - saved > -1e-8:
-        if isinstance(y0, Function):
-            f.save_function(y0, idx=count_save)
-            f.set_attr('/times', str(count_save), t)
-            f.set_attr('/times', 'last_idx', count_save)
-            count_save += 1
-        else:
-            np.savetxt(f, [[t] + [x for x in y0]], delimiter=',')
-        
+        count_save = save_result_step(f, y0, t, count_save)
 
     return y0
-

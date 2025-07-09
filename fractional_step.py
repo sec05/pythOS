@@ -7,6 +7,7 @@ from scipy.integrate import solve_ivp
 import sys
 import time as timeos
 import csv
+from utils import process_function_list, save_result_setup, save_result_step
 
 try:
     from firedrake import Function, Constant, replace, CheckpointFile, Form
@@ -23,18 +24,12 @@ except Exception as e:
     ButcherTableau = type(None)
     
 
-try:
-    from sundials import SundialsSolver
-    from cvode import CVODE
-    from ida import IDA
-    from arkode import ARKStep, ERKStep, MRIStep
-    from sundials_exode import SundialsExode
-except Exception as e:
-    print('no sundials solvers')
-    cvode = False
-    SundialsSolver = type(None)
-    IDA = type(None)
-    SundialsExode = type(None)
+from sundials import SundialsSolver
+from cvode import CVODE
+from ida import IDA
+from arkode import ARKStep, ERKStep, MRIStep
+from sundials_exode import SundialsExode
+
 
 def time_step(function, delta_t, y, initial_t,
                     tableau, restore=False, **kwargs):
@@ -144,7 +139,7 @@ def exact_solution(function, initial_t, delta_t, initial_y, ivp_method,
 
 def process_os_options(functions, initial_y, initial_t, delta_t, alpha, methods, b=None, ivp_methods={}, epi_options={}, jacobian = None, solver_options = {}):
     alpha, order, k_factor = alphas_repo(alpha, b, len(functions))
-    
+
     if order is not None:
         if isinstance(delta_t, Function):
             delta_t.assign(1)
@@ -292,16 +287,7 @@ def fractional_step_inner(functions, delta_t, initial_y, initial_t, final_t,
         else:
             delta_t = float(delta_t)
     if fname is not None:
-        if isinstance(initial_y, Function):
-            f = CheckpointFile(fname, 'w')
-            f.save_mesh(initial_y.function_space().mesh())
-            f.save_function(initial_y, idx=0)
-            f.create_group('times')
-            f.set_attr('/times', '0', t)
-            count_save = 1
-        else:
-            f=open(fname, 'wb')
-            np.savetxt(f, [[initial_t] + [x for x in y]], delimiter=',')
+        f, count_save = save_result_setup(fname, initial_y, initial_t, t, y=y)
         saved = t
 
     if save_steps != 0:
@@ -464,14 +450,7 @@ def fractional_step_inner(functions, delta_t, initial_y, initial_t, final_t,
             delta_t = compute_time(err, order, delta_t)
             scale = delta_t
         if fname is not None and ((save_steps == 0 and accept) or t - saved - save_interval > -1e-8):
-            if isinstance(initial_y, Function):
-                f.save_function(y, idx=count_save)
-                f.set_attr('/times', str(count_save), t)
-                f.set_attr('/times', 'last_idx', count_save)
-                count_save += 1
-            else:
-
-                np.savetxt(f, [[t]+[x for x in y]], delimiter=',') 
+            count_save = save_result_step(f, initial_y, t, count_save, y=y)
             saved += ((t - saved + 1e-8) // save_interval) * save_interval
         if not isinstance(y, Function) and not np.all(np.isfinite(y)):
             return np.nan*y
@@ -494,8 +473,8 @@ def fractional_step_inner(functions, delta_t, initial_y, initial_t, final_t,
     return y
 
 def fractional_step(
-        functions, delta_t, initial_y, initial_t, final_t, alpha,
-        methods={},b=None, fname=None, save_steps=0, ivp_methods={},
+        master_function, delta_t, initial_y, initial_t, final_t, alpha,
+        methods={},function_labels=None, b=None, fname=None, save_steps=0, ivp_methods={},
         epi_options={}, os_rtol = 1e-3, os_atol = 1e-6, solver_parameters={}, jacobian=None,
         bc=None, stats=False):
     """
@@ -503,14 +482,21 @@ def fractional_step(
     to approximate a differential equation
     Inputs
     ------
-    functions : list of functions to use
-        functions to use to approximate the differential equation in order
-        the functions will be numbered 1 to n
-        if any element returns np.nan, that element will not be integrated for 
-        that time step
-        inputs are (t, y)
-        These may also be finite element Forms as provided by firedrake, or
-        tuples of (Form, boundary condition)
+    master_function : list of functions or callable function(t, y, label)
+        if list of functions:
+            each is used use to approximate the differential equation in order
+            the functions will be numbered 1 to n
+            if any element returns np.nan, that element will not be integrated for 
+            that time step
+            inputs are (t, y)
+            These may also be finite element Forms as provided by firedrake, or
+            tuples of (Form, boundary condition)
+        if callable function(t, y, label):
+            each label is used to select the function to use
+            the labels are provided in function_labels
+            the function will be called with inputs (t, y, label)
+            then each function will be processed with process_label()
+            and the result will be a list of functions used to approximate the differential equation
     delta_t : float
         the amount the time will increase by
     initial_y
@@ -525,6 +511,11 @@ def fractional_step(
         a string with the name of the operator splitting method to use,
         or a list of lists representing each substep to take
         at each location
+    function_labels - optional. list of strings or tuples of strings
+        the labels to use for each function in master_function
+        tuples should be of the form (label1, label2, ...)
+        which is then mapped to the operator O(t,y) = master_function(t,y,label1) + master_function(t,y,label2) + ...
+        if master_function is a list of functions, this is ignored
     b value needs to be determined if OS22b method is called to use a particular 2nd-order 2-stage OS method
     methods
         a dictionary providing the methods to use at each step.
@@ -561,7 +552,9 @@ def fractional_step(
             initial_y=np.array(initial_y, np.complex128)
         else:
             initial_y=np.array(initial_y, np.float64)
-            
+
+    functions = process_function_list(master_function, function_labels, initial_y, ivp_methods)
+
     if alpha in adi_list:
         time=initial_t
         y=initial_y
@@ -570,7 +563,7 @@ def fractional_step(
             time+=delta_t
     elif alpha=='average Godunov':
         time=initial_t
-        y=initial_y
+        y=initial_y 
         while time<final_t:
             y=ave_Godunov_step(functions, time, y, delta_t)
             time+=delta_t
@@ -933,3 +926,15 @@ adi_list=['MCS', 'HV', 'DR']
 
 from Epi_multistep import EpiMultistep, epi_methods
 
+def process_label(master_function, label):
+    if isinstance(label, tuple):
+        op = label[0]
+        if op == "prod":
+            label = label[1:]
+            return lambda t, y, label=label: np.multiply.reduce([master_function(t, y, l) for l in label])
+        else:
+            if op == "sum":
+                label = label[1:]
+            return lambda t, y, label=label: sum(master_function(t, y, l) for l in label)
+    else:
+        return lambda t, y, label=label: master_function(t, y, label)

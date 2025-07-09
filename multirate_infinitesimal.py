@@ -1,5 +1,6 @@
 from scipy.integrate import solve_ivp
 from scipy.optimize import root
+from utils import process_label, save_result_setup, save_result_step
 import numpy as np
 try:
     from firedrake import Function, dx, solve, Constant, replace, inner, CheckpointFile
@@ -166,7 +167,7 @@ class Multirate_Infinitesimal:
 
 
 
-def multirate_infinitesimal_solve(y0, t0, dt, tf, method, fi, ff, fe=None, fname=None, save_steps=None, bcs=None, ivp_options={}, ivp_method = 'RK45', implicit_solve_options={}):
+def multirate_infinitesimal_solve(y0, t0, dt, tf, method, fi=None, ff=None, fe=None, master_function=None, fname=None, save_steps=None, bcs=None, ivp_options={}, ivp_method = 'RK45', implicit_solve_options={}):
     """ This function uses a multirate infinitesimal method to solve a differential equation
     -----
     Inputs:
@@ -179,9 +180,18 @@ def multirate_infinitesimal_solve(y0, t0, dt, tf, method, fi, ff, fe=None, fname
     method - the method to use (of type Multirate_Infinitesimal)
     fi - the slow operator of the differential equation, with inputs (t, y)
            if there are more than one (for imex-gark), this is the one that will be solved implicitly (with the gamma coefficients)
-    ff - the fast operator of the differential equation, with inputs (t, y)
+           this is either a function or a label. If it is a label, then there must be a master_function provided.
+    ff - the fast operator of the differential equation, with inputs (t, y), 
+        this is either a function or a label. If it is a label, then there must be a master_function provided.
     fe (optional) - the second slow operator, with inputs (t, y)
                 these operators may also be finite element Forms from firedrake.
+                This is either a function or a label. If it is a label, then there must be a master_function provided.
+    master_function - a function that takes inputs (t, y, label) and returns the value of the operator specified by label
+    Notes:
+        - master_function(t,y,label) must return fi on master_function(t,y,fi),
+            ff on master_function(t,y,ff), and fe on master_function(t,y,fe)
+        - fi and ff must be callable if master_function is not provided.
+        - If master_function is provided, then fi, ff, and fe (if necessary) must be non-callable labels.
     bcs - optional.  Only used if using the finite element version.  The boundary condition(s) to apply.
     implicit_solve_parameters - optional.  Any solver parameters to use (see firedrake documentation or scipy.roots documentation for details)
     fname - optional.  If provided, will save intermediate results to this file.
@@ -197,20 +207,25 @@ def multirate_infinitesimal_solve(y0, t0, dt, tf, method, fi, ff, fe=None, fname
     the approximate value of y at tf
     """
     
+    if master_function is None and (fi is None or ff is None):
+        raise ValueError("Either master_function or both fi and ff must be provided.")
+    elif (master_function !=  None) and  callable(fi) and callable(ff):
+        raise ValueError("If master_function is passed then, fi and ff must be labels.")   
+    if not callable(fi):
+        fi = process_label(master_function, fi)
+    if not callable(ff):
+        ff = process_label(master_function, ff)
+    if fe != None and not callable(fe):    
+        try:
+            fe = process_label(master_function, fe)
+        except Exception as e:
+            fe = None
+
     t = t0
     if isinstance(t, Constant):
         t = float(t.values()[0])
     if fname is not None:
-        if isinstance(y0, Function):
-            f = CheckpointFile(fname, 'w')
-            f.save_mesh(y0.function_space().mesh())
-            f.save_function(initial_y, idx=0)
-            f.create_group('times')
-            f.set_attr('/times', '0', t)
-            count_save = 1
-        else:
-            f = open(fname, 'wb')
-            np.savetxt(f, [[t0] + [x for x in y0]], delimiter=',')
+        f, count_save = save_result_setup(fname, y0, t0, t)
         saved = t
 
     if save_steps is not None:
@@ -227,13 +242,7 @@ def multirate_infinitesimal_solve(y0, t0, dt, tf, method, fi, ff, fe=None, fname
         y0 = method.step(y0, dt, fi, ff, t0, fe=fe, bcs=bcs, ivp_options=ivp_options, ivp_method=ivp_method, implicit_solve_options=implicit_solve_options)
         t += dt
         if fname is not None and t - saved - save_interval > -1e-8:
-            if isinstance(y0, Function):
-                f.save_function(y0, idx=count_save)
-                f.set_attr('/times', str(count_save), t)
-                f.set_attr('/times', 'last_idx', count_save)
-                count_save += 1
-            else:
-                np.savetxt(f, [[t] + [x for x in y0]], delimiter=',')
+            count_save = save_result_step(f, y0, t, count_save)
             saved += ((t - saved + 1e-8) // save_interval) * save_interval
         if dt > tf - t:
             dt = tf - t
@@ -242,18 +251,25 @@ def multirate_infinitesimal_solve(y0, t0, dt, tf, method, fi, ff, fe=None, fname
         else:
             t0 = t
     if fname is not None and abs(t - saved) > 1e-8:
-        if isinstance(y0, Function):
-            f.save_function(y0, idx=count_save)
-            f.set_attr('/times', str(count_save), t)
-            f.set_attr('/times', 'last_idx', count_save)
-            count_save += 1
-        else:
-            np.savetxt(f, [[t] + [x for x in y0]], delimiter=',')
+        count_save = save_result_step(f, y0, t, count_save)
     if fname is not None:
         f.close()
     if isinstance(ivp_method, SundialsExode):
         ivp_method.free()
     return y0
+
+def process_label(master_function, label):
+    if isinstance(label, tuple):
+        op = label[0]
+        if op == "prod":
+            label = label[1:]
+            return lambda t, y, label=label: np.multiply.reduce([master_function(t, y, l) for l in label])
+        else:
+            if op == "sum":
+                label = label[1:]
+            return lambda t, y, label=label: sum(master_function(t, y, l) for l in label)
+    else:
+        return lambda t, y, label=label: master_function(t, y, label)
 
 cs = np.array([0, 1/3, 3/4, 1])
 gamm = np.array([[[0,0,0,0],
